@@ -1,1 +1,223 @@
+#############################################
+# Mapping deforestation height with R
+# Milos Popovic 2024/09/09
+#############################################
 
+pacman::p_load(
+    geodata,
+    terra,
+    sf,
+    maptiles,
+    tidyverse,
+    tidyterra
+)
+
+# 1. COUNTRY SF
+#--------------
+
+get_country_admin1 <- function() {
+    main_path <- getwd()
+    country_admin1 <- geodata::gadm(
+        country = c("AND", "ESP", "PRT"),
+        level = 1,
+        path = main_path
+    ) |>
+        sf::st_as_sf()
+
+    return(country_admin1)
+}
+
+country_admin1 <- get_country_admin1()
+# # print(country_admin1, n = 45)
+
+country_sf <- country_admin1 |>
+    dplyr::filter(
+        !NAME_1 %in% c(
+            "Islas Canarias",
+            "Azores", "Madeira",
+            "Islas Baleares",
+            "Ceuta y Melilla"
+        )
+    ) |>
+    sf::st_as_sf() |>
+    sf::st_union() |>
+    sf::st_as_sf()
+
+plot(sf::st_geometry(country_sf))
+
+# 2. FOREST DATA
+#---------------
+
+options(timeout = 999)
+
+urls <- c(
+    "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2023-v1.11/Hansen_GFC-2023-v1.11_lossyear_50N_010W.tif",
+    "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2023-v1.11/Hansen_GFC-2023-v1.11_lossyear_50N_000E.tif",
+    "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2023-v1.11/Hansen_GFC-2023-v1.11_lossyear_40N_010W.tif",
+    "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2023-v1.11/Hansen_GFC-2023-v1.11_lossyear_40N_000E.tif",
+
+    "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2023-v1.11/Hansen_GFC-2023-v1.11_treecover2000_50N_010W.tif",
+    "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2023-v1.11/Hansen_GFC-2023-v1.11_treecover2000_50N_000E.tif",
+    "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2023-v1.11/Hansen_GFC-2023-v1.11_treecover2000_40N_010W.tif",
+    "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2023-v1.11/Hansen_GFC-2023-v1.11_treecover2000_40N_000E.tif"
+)
+
+filenames <- basename(urls)
+
+for (i in seq_along(urls)) {
+    download.file(
+        url = urls[i],
+        destfile = file.path(getwd(), filenames[i]),
+        mode = "wb"
+    )
+}
+
+forest_data <- lapply(
+    filenames, terra::rast
+)
+
+# 3. CROP DATA
+#-------------
+
+forest_region <- lapply(
+    forest_data,
+    function(x) {
+        terra::crop(
+            x,
+            terra::vect(country_sf),
+            snap = "in",
+            mask = TRUE
+        )
+    }
+)
+
+# 4. MOSAIC
+#----------
+
+# mosaic tree loss
+
+forest_loss <- do.call(
+    terra::mosaic,
+    forest_region[c(1:4)]
+)
+
+# terra::plot(forest_loss)
+
+# mosaic tree cover
+forest_cover <- do.call(
+    terra::mosaic,
+    forest_region[c(5:8)]
+)
+
+# 5. FOREST COVER
+#----------------
+
+forest_cover <- terra::ifel(
+    forest_cover > 0,
+    1,
+    NA
+)
+
+pal <- c(
+    # "#3D7A37",
+    "#426642",
+    "#EA0100"
+)
+
+forest_loss <- terra::ifel(
+    forest_loss > 0,
+    2,
+    NA
+)
+
+forest_cover_loss <- terra::mosaic(
+    forest_loss, forest_cover,
+    fun = "max"
+)
+
+# 6. BACKGROUND MAP
+#------------------
+
+bbox <- sf::st_bbox(
+    country_sf
+)
+
+bg_map <- maptiles::get_tiles(
+    x = bbox,
+    provider = "Esri.WorldShadedRelief",
+    zoom = 9,
+    crop = TRUE,
+    project = FALSE
+)
+
+terra::plotRGB(
+    bg_map
+)
+
+proj <- "EPSG:3857"
+
+# 7. MAP
+#-------
+
+map <- ggplot() +
+    tidyterra::geom_spatraster_rgb(
+        data = bg_map,
+        maxcell = ncell(bg_map),
+        alpha = .65
+    ) +
+    tidyterra::geom_spatraster(
+        data = as.factor(forest_cover_loss),
+        alpha = 1,
+        maxcell = ncell(bg_map)
+    ) +
+    geom_sf(
+        data = country_sf, fill = "transparent",
+        color = "grey30", linewidth = .05
+    ) +
+    coord_sf(crs = proj) +
+    scale_fill_manual(
+        name = "IBERIA | tree cover",
+        labels = c(
+            "Tree cover in 2000",
+            "Loss (2001-2023)"
+        ),
+        values = pal,
+        drop = FALSE,
+        na.translate = FALSE
+    ) +
+    theme_void() +
+    guides(
+        fill = guide_legend(
+            direction = "vertical",
+            keyheight = unit(.25, units = "cm"),
+            keywidth = unit(.25, units = "cm"),
+            drop = FALSE
+        )
+    ) +
+    theme(
+        legend.position = c(.8, .2),
+        legend.title = element_text(
+            size = 9, color = "grey20",
+            vjust = 0, family = "URWHelvetica",
+            face = "bold"
+        ),
+        legend.text = element_text(
+            size = 8, color = "grey20",
+            family = "URWHelvetica"
+        ),
+        plot.margin = unit(
+            c(
+                t = -.75, b = -.75,
+                l = -.75, r = -.75
+            ), "cm"
+        )
+    )
+
+ggsave(
+    "iberia-forest-loss.png",
+    map,
+    width = ncol(bg_map) / 750,
+    height = nrow(bg_map) / 750,
+    units = "in",
+    bg = "white"
+)
